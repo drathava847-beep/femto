@@ -64,6 +64,20 @@ def find_next(buffer, term, options, start_x, start_y, wrap=True):
             return pos, y, end - pos
     return None
 
+def find_all(buffer, term, options):
+    """Return all matches in the buffer as (pos, y, length)."""
+    matches = []
+    for y, line in enumerate(buffer.lines):
+        start = 0
+        while True:
+            hit = find_in_line(line, term, options, start)
+            if hit is None:
+                break
+            pos, end = hit
+            matches.append((pos, y, end - pos))
+            start = end if end > pos else pos + 1
+    return matches
+
 
 def replace_in_line(line, pos, end, replacement):
     """Splice `replacement` over [pos, end) in `line`."""

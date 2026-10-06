@@ -86,6 +86,7 @@ class Key:
     SHIFT_TAB = curses.KEY_BTAB
 
     # Terminal
+    F1 = curses.KEY_F1
     RESIZE = curses.KEY_RESIZE
     ESCAPE = 27
 

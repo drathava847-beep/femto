@@ -1,51 +1,46 @@
 """
 Text buffer management for Femto.
 
-The buffer owns the logical text (a list of lines) plus file I/O.
-Since v0.0.2rc1 every mutation bumps a `revision` counter (via
-`touch()`), which the renderer uses to skip redraws of unchanged
-frames.  Saves are atomic: temp file -> fsync -> os.replace.
+I/O Fidelity (v0.0.3a01):
+  * Detects dominant line ending (CRLF/CR/LF) on load.
+  * Normalizes to \n internally so cursor math and wrapping stay clean.
+  * Re-applies the correct ending on save (.femtorc can override).
+  * Ensures POSIX-compliant trailing newlines.
 """
 
 import os
 
 from femto.search import SearchOptions, find_next
 
-NEWLINE_LF = "\n"
-NEWLINE_CRLF = "\r\n"
-NEWLINE_CR = "\r"
 
+# ── module-level I/O helpers (imported by the test-suite) ──────
 
 def detect_newline(content):
-    """Return the dominant line ending in raw file text.
+    """Return the dominant line ending of raw file content.
 
-    CRLF is counted before lone CR/LF so a Windows file is not reported
-    as LF. Empty text defaults to LF.
+    CRLF is counted before lone CR/LF so mixed files prefer CRLF.
     """
-    crlf = content.count(NEWLINE_CRLF)
-    lone_cr = content.count("\r") - crlf
-    lone_lf = content.count("\n") - crlf
-    if crlf >= lone_lf and crlf >= lone_cr and crlf > 0:
-        return NEWLINE_CRLF
-    if lone_cr > lone_lf and lone_cr > 0:
-        return NEWLINE_CR
-    return NEWLINE_LF
+    crlf = content.count('\r\n')
+    rest = content.replace('\r\n', '')
+    cr = rest.count('\r')
+    lf = rest.count('\n')
+    if crlf and crlf >= lf and crlf >= cr:
+        return '\r\n'
+    if cr > lf:
+        return '\r'
+    return '\n'
 
 
-def resolve_newline(configured, detected):
-    """Map `line_ending` config onto the ending used when saving.
-
-    `auto` (the default) keeps the ending detected at load. Explicit
-    `lf` / `crlf` / `cr` override it. Unknown values fall back to auto.
-    """
-    choice = (configured or "auto").strip().lower()
-    if choice in ("lf", "unix", "\\n"):
-        return NEWLINE_LF
-    if choice in ("crlf", "windows", "dos", "\\r\\n"):
-        return NEWLINE_CRLF
-    if choice in ("cr", "mac", "\\r"):
-        return NEWLINE_CR
-    return detected or NEWLINE_LF
+def resolve_newline(config, detected):
+    """Apply the .femtorc `line_ending` override to a detected ending."""
+    override = getattr(config, 'line_ending', 'auto')
+    if override == 'crlf':
+        return '\r\n'
+    if override == 'cr':
+        return '\r'
+    if override == 'lf':
+        return '\n'
+    return detected
 
 
 class Buffer:
@@ -55,58 +50,66 @@ class Buffer:
         self.lines = [""]
         self.filename = None
         self.modified = False
-        self.revision = 0          # render-cache invalidation counter
+        self.revision = 0
         self.config = config
-        self.newline = NEWLINE_LF
-        self.ends_with_newline = False
+
+        # I/O state
+        self.line_ending = '\n'
+        self.had_final_newline = False
 
     # ── File I/O ──────────────────────────────────────────────
 
     def load_file(self, filepath):
-        """Load a file into the buffer."""
+        """Load a file, detecting line endings and normalizing internally."""
         self.filename = filepath
-        self.newline = NEWLINE_LF
-        self.ends_with_newline = False
+        self.line_ending = '\n'
+        self.had_final_newline = False
+
         if filepath and os.path.exists(filepath):
             try:
-                # newline='' disables universal-newline translation so the
-                # original CRLF/CR bytes are still visible for detection.
                 with open(filepath, 'r', encoding='utf-8', newline='') as f:
                     content = f.read()
-                    spaces = " " * self.config.tab_size
-                    content = content.replace('\t', spaces)
-                    self.newline = detect_newline(content)
-                    self.ends_with_newline = content.endswith(("\n", "\r"))
-                    self.lines = content.splitlines()
-                    if not self.lines:
-                        self.lines = [""]
-                        self.ends_with_newline = False
+
+                self.line_ending = detect_newline(content)
+                self.had_final_newline = content.endswith(('\n', '\r'))
+
+                # Normalize to \n internally (keeps cursor math clean)
+                content = content.replace('\r\n', '\n').replace('\r', '\n')
+
+                spaces = " " * self.config.tab_size
+                self.lines = content.replace('\t', spaces).split('\n')
+
+                # A trailing newline leaves an extra empty string; drop it
+                if self.had_final_newline and self.lines and self.lines[-1] == '':
+                    self.lines.pop()
+                if not self.lines:
+                    self.lines = [""]
             except Exception as e:
                 self.lines = [f"Error reading file: {e}"]
         else:
             self.lines = [""]
+
         self.modified = False
         self.revision = 0
 
     def save(self):
-        """Atomic save: write temp file, fsync, os.replace into place.
-
-        With `make_backup = true` in .femtorc the previous version is
-        kept as `<name>~`.
-        """
+        """Atomic save with correct line endings and trailing newline."""
         if not self.filename:
             return False
+
+        ending = resolve_newline(self.config, self.line_ending)
+        final_nl = getattr(self.config, 'final_newline', True)
+
         tmp = self.filename + ".femto-tmp"
         try:
-            newline = resolve_newline(
-                getattr(self.config, 'line_ending', 'auto'), self.newline)
-            payload = newline.join(self.lines)
-            if self.lines and self.ends_with_newline:
-                payload += newline
             with open(tmp, 'w', encoding='utf-8', newline='') as f:
-                f.write(payload)
+                text = ending.join(self.lines)
+                if final_nl or self.had_final_newline:
+                    text += ending
+                f.write(text)
                 f.flush()
                 os.fsync(f.fileno())
+
             if getattr(self.config, 'make_backup', False) \
                     and os.path.exists(self.filename):
                 os.replace(self.filename, self.filename + "~")
@@ -128,20 +131,17 @@ class Buffer:
     # ── Editing ───────────────────────────────────────────────
 
     def insert_char(self, x, y, char):
-        """Insert a character at (x, y)."""
         line = self.lines[y]
         self.lines[y] = line[:x] + char + line[x:]
         self.touch()
 
     def insert_newline(self, x, y):
-        """Split the line at (x, y) into two lines."""
         line = self.lines[y]
         self.lines[y] = line[:x]
         self.lines.insert(y + 1, line[x:])
         self.touch()
 
     def delete_char(self, x, y):
-        """Delete the character at (x, y), merging lines at EOL."""
         if x < len(self.lines[y]):
             line = self.lines[y]
             self.lines[y] = line[:x] + line[x + 1:]
@@ -152,9 +152,8 @@ class Buffer:
             self.touch()
 
     def backspace(self, x, y):
-        """Handle backspace at (x, y); returns new (x, y)."""
         if x > 0:
-            self.delete_char(x - 1, y)     # touches internally
+            self.delete_char(x - 1, y)
             return x - 1, y
         elif y > 0:
             prev_len = len(self.lines[y - 1])
@@ -167,7 +166,6 @@ class Buffer:
     # ── Tab / Indentation ─────────────────────────────────────
 
     def insert_tab(self, y, x):
-        """Insert `tab_size` spaces at cursor; returns new x."""
         spaces = " " * self.config.tab_size
         line = self.lines[y]
         self.lines[y] = line[:x] + spaces + line[x:]
@@ -175,7 +173,6 @@ class Buffer:
         return x + len(spaces)
 
     def remove_tab(self, y, x):
-        """Remove up to `tab_size` leading spaces; returns new x."""
         line = self.lines[y]
         spaces_to_remove = 0
         for i in range(min(self.config.tab_size, len(line))):
@@ -189,10 +186,18 @@ class Buffer:
             return max(0, x - spaces_to_remove)
         return x
 
+    # ── Auto-indent helper (v0.0.3a02) ────────────────────────
+
+    def get_leading_whitespace(self, y):
+        """Returns the leading whitespace string of line y."""
+        if 0 <= y < len(self.lines):
+            line = self.lines[y]
+            return line[:len(line) - len(line.lstrip())]
+        return ""
+
     # ── Word Navigation ───────────────────────────────────────
 
     def get_next_word_pos(self, y, x):
-        """X position of the start of the next word on line y."""
         line = self.lines[y]
         while x < len(line) and line[x].isalnum():
             x += 1
@@ -201,7 +206,6 @@ class Buffer:
         return x
 
     def get_prev_word_pos(self, y, x):
-        """X position of the start of the previous word on line y."""
         line = self.lines[y]
         if x == 0:
             return 0
@@ -212,26 +216,19 @@ class Buffer:
             x -= 1
         return x + 1
 
-    # ── Search ────────────────────────────────────────────────
+    # ── Search ───────────────────────────────────────────────
 
     def find_text(self, term, start_x, start_y):
-        """Case-sensitive plain search (back-compat wrapper).
-
-        Returns (x, y) or None.  Full-featured search (case/regex/wrap
-        control, match length) lives in femto.search.
-        """
         hit = find_next(self, term, SearchOptions(), start_x, start_y)
         return (hit[0], hit[1]) if hit else None
 
-    # ── Helpers ───────────────────────────────────────────────
+    # ── Helpers ──────────────────────────────────────────────
 
     def get_line_length(self, y):
-        """Length of line y (0 for out-of-range rows)."""
         if 0 <= y < len(self.lines):
             return len(self.lines[y])
         return 0
 
     @property
     def max_y(self):
-        """Maximum valid line index."""
         return max(0, len(self.lines) - 1)

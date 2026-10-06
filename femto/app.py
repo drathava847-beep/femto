@@ -6,8 +6,10 @@ keeps a list plus the shared clipboard / search options / replace flow.
 
 import signal
 import curses
+import os
 
 from femto.documents import Document
+from femto.help import HelpView
 from femto.renderer import Renderer
 from femto.layout import (
     get_visual_position,
@@ -17,10 +19,13 @@ from femto.layout import (
 from femto.prompt import Prompt
 from femto.clipboard import Clipboard
 from femto.config import Config
-from femto.search import SearchOptions, find_next, replace_in_line
+from femto.search import SearchOptions, find_all, find_next, replace_in_line
 from femto.keys import (
     Key, alt, is_backspace, is_enter, ALT_BASES, CONHOST_ALT_MAP,
 )
+from femto.help import KEYBINDINGS
+
+HELP_ESCAPE_DELAY_MS = 100
 
 
 def _ignore_suspend():
@@ -35,6 +40,7 @@ def _ignore_suspend():
 
 class Mode:
     NORMAL = "normal"
+    HELP = "help"
     SAVE_AS = "save_as"
     SEARCH = "search"
     REPLACE_SEARCH = "replace_search"
@@ -58,6 +64,7 @@ class Application:
         self.message = ""
         self.running = True
         self.mode = Mode.NORMAL
+        self.help_scroll_y = 0
         self.prompt = Prompt()
         self.clipboard = Clipboard()
         self.search_options = SearchOptions(self.config.ignore_case,
@@ -70,6 +77,9 @@ class Application:
         self._prompt_base = "Search"
         self._save_target = self.doc
         self._save_queue = []
+        self._save_completion_prefix = ""
+        self._save_completion_candidates = []
+        self._save_completion_index = -1
 
     # ── per-document shortcuts ────────────────────────────────
 
@@ -215,6 +225,21 @@ class Application:
         self.cursor.x, self.cursor.y = nx, ny
         self.message = f"Pasted {len(self.clipboard.text)} chars."
 
+    def _copy_to_clipboard(self, text):
+        self.clipboard.store(text)
+        if self.config.system_clipboard:
+            from femto.sysclip import copy_to_system
+            copy_to_system(text)
+
+    def _paste_from_clipboard(self):
+        text = self.clipboard.text
+        if not text and self.config.system_clipboard:
+            from femto.sysclip import paste_from_system
+            text = paste_from_system()
+            if text:
+                self.clipboard.store(text)
+        return text
+
     # ── mouse ────────────────────────────────────────────────
 
     def _handle_mouse(self, stdscr):
@@ -256,6 +281,13 @@ class Application:
     # ── input routing ─────────────────────────────────────────
 
     def handle_input(self, key, screen_rows, screen_cols):
+        if self.mode == Mode.HELP:
+            self._handle_help(key, screen_rows, screen_cols)
+            return
+        if self.mode == Mode.NORMAL and key == Key.F1:
+            self.help_scroll_y = 0
+            self.mode = Mode.HELP
+            return
         if self.mode == Mode.SAVE_AS:
             self._handle_save_as(key)
         elif self.mode == Mode.SEARCH:
@@ -273,9 +305,34 @@ class Application:
         else:
             self._handle_normal(key, screen_rows, screen_cols)
 
+    def _handle_help(self, key, screen_rows, screen_cols):
+        if key in (Key.ESCAPE, ord('q')):
+            self.mode = Mode.NORMAL
+            return
+        actions = {
+            Key.ARROW_UP: "up", Key.ARROW_DOWN: "down",
+            Key.PAGE_UP: "page_up", Key.PAGE_DOWN: "page_down",
+            Key.HOME: "home", Key.END: "end",
+        }
+        if key in actions:
+            view = HelpView(self.help_scroll_y)
+            view.move(actions[key], screen_rows, screen_cols)
+            self.help_scroll_y = view.offset
+
     # ── save / exit with multi-buffer queue ───────────────────
 
+    def _reset_save_completion(self):
+        self._save_completion_prefix = ""
+        self._save_completion_candidates = []
+        self._save_completion_index = -1
+
     def _handle_save_as(self, key):
+        if key == Key.TAB:
+            self._complete_save_as()
+            return
+
+        self._reset_save_completion()
+
         result = self.prompt.handle_key(key)
         if result == 'confirmed':
             filename = self.prompt.text.strip()
@@ -302,6 +359,61 @@ class Application:
             self._save_queue = []
             self.message = "Save cancelled."
 
+    def _complete_save_as(self):
+        text = self.prompt.text
+
+        if not self._save_completion_candidates:
+            directory = os.path.dirname(text) or "."
+            prefix = os.path.basename(text)
+
+            try:
+                candidates = [
+                    name for name in os.listdir(directory)
+                    if name.startswith(prefix)
+                ]
+            except OSError:
+                candidates = []
+
+            if not candidates:
+                self.message = "No matches."
+                return
+
+            self._save_completion_prefix = text
+            self._save_completion_candidates = candidates
+            self._save_completion_index = -1
+
+            common = os.path.commonprefix(candidates)
+
+            if common != prefix:
+                path_prefix = (
+                    text[:-len(prefix)] if prefix else text
+                )
+                completed = path_prefix + common
+                self.prompt.text = completed
+                self.prompt.cursor_pos = len(completed)
+                self.message = "  ".join(candidates)
+                return
+
+        candidates = self._save_completion_candidates
+        self._save_completion_index = (
+            self._save_completion_index + 1
+        ) % len(candidates)
+
+        original = self._save_completion_prefix
+        directory = os.path.dirname(original)
+        path_prefix = (
+            original[:-len(os.path.basename(original))]
+            if os.path.basename(original)
+            else original
+        )
+
+        candidate = candidates[self._save_completion_index]
+        completed = path_prefix + candidate
+
+        self.prompt.text = completed
+        self.prompt.cursor_pos = len(completed)
+        self.message = "  ".join(candidates)
+
     def _save_next_in_queue(self, exit_after):
         """Save queued modified docs; prompt for unnamed ones in turn."""
         self.pending_exit = exit_after
@@ -318,6 +430,7 @@ class Application:
                 return
             self._save_target = d
             self.mode = Mode.SAVE_AS
+            self._reset_save_completion()
             self.prompt.start("Save As: ")
             return
         if exit_after:
@@ -355,6 +468,23 @@ class Application:
         elif result == 'cancelled':
             self._exit_prompt_mode()
 
+    def _get_search_matches(self, term):
+        cache_key = (
+            self.buffer.revision,
+            term,
+            self.search_options.ignore_case,
+            self.search_options.regex,
+        )
+
+        if self.doc.search_cache is not None:
+            key, matches = self.doc.search_cache
+            if key == cache_key:
+                return matches
+
+        matches = find_all(self.buffer, term, self.search_options)
+        self.doc.search_cache = (cache_key, matches)
+        return matches
+
     def _find_text(self, term):
         if (self.last_match and
                 self.last_match[:2] == (self.cursor.x, self.cursor.y)):
@@ -362,6 +492,7 @@ class Application:
             sy = self.cursor.y
         else:
             sx, sy = self.cursor.x, self.cursor.y
+        matches = self._get_search_matches(term)
         hit = find_next(self.buffer, term, self.search_options, sx, sy)
         if hit:
             x, y, length = hit
@@ -508,6 +639,7 @@ class Application:
                     self.message = "Error: could not save file."
             else:
                 self.mode = Mode.SAVE_AS
+                self._reset_save_completion()
                 self.prompt.start("Save As: ")
             return
         if key == Key.CTRL_F:
@@ -607,7 +739,23 @@ class Application:
             self._pre_edit()
             buf.insert_newline(cur.x, cur.y)
             cur.y += 1
-            cur.x = 0
+
+            # Auto-indent logic
+            if self.config.auto_indent:
+                indent = buf.get_leading_whitespace(cur.y - 1)
+
+                # Python-specific: add extra indent if previous line ends with ':'
+                # We split on '#' to ignore inline comments (e.g., `def foo(): #hi`)
+                if buf.filename and buf.filename.endswith(".py"):
+                    prev_line_code = buf.lines[cur.y - 1].split('#')[0].rstrip()
+                    if prev_line_code.endswith(':'):
+                        indent += " " * self.config.tab_size
+
+                buf.lines[cur.y] = indent + buf.lines[cur.y]
+                buf.touch()
+                cur.x = len(indent)
+            else:
+                cur.x = 0
         elif 32 <= key <= 126:
             self._pre_edit()
             buf.insert_char(cur.x, cur.y, chr(key))
@@ -665,7 +813,20 @@ class Application:
     # ── input reading ─────────────────────────────────────────
 
     def _read_key(self, stdscr):
-        key = stdscr.getch()
+        # curses can otherwise wait a full second before returning bare Esc.
+        # Keep the shorter sequence timeout local to HELP and preserve the
+        # terminal's configured delay for editing and prompts (Python 3.9+).
+        get_delay = getattr(curses, "get_escdelay", None)
+        set_delay = getattr(curses, "set_escdelay", None)
+        previous_delay = None
+        if self.mode == Mode.HELP and get_delay and set_delay:
+            previous_delay = get_delay()
+            set_delay(min(previous_delay, HELP_ESCAPE_DELAY_MS))
+        try:
+            key = stdscr.getch()
+        finally:
+            if previous_delay is not None:
+                set_delay(previous_delay)
 
         if key in CONHOST_ALT_MAP:
             return alt(CONHOST_ALT_MAP[key])
@@ -676,11 +837,17 @@ class Application:
                 return mapped
 
         if key == 27:
-            curses.halfdelay(2)
+            if self.mode == Mode.HELP:
+                stdscr.timeout(HELP_ESCAPE_DELAY_MS)
+            else:
+                curses.halfdelay(2)
             try:
                 nxt = stdscr.getch()
             finally:
-                curses.cbreak()
+                if self.mode == Mode.HELP:
+                    stdscr.timeout(-1)
+                else:
+                    curses.cbreak()
             if nxt == -1:
                 return 27
             if nxt == ord('['):
@@ -736,32 +903,43 @@ class Application:
 
         while self.running:
             screen_rows, screen_cols = self.renderer.get_dimensions()
-            text_cols = max(1, screen_cols - self._gutter_width())
-
-            vx, vy = get_visual_position(
-                self.cursor.x, self.cursor.y, self.buffer.lines,
-                text_cols, self.config.soft_wrap)
-            self.cursor.update_scroll(
-                vy, vx, screen_rows, text_cols,
-                self.config.smooth_scroll_margin, self.config.soft_wrap)
-
             sel = None
-            if self.selection.active:
-                bounds = self._current_bounds()
-                if not self.selection.is_empty(bounds):
-                    sel = bounds
+            if self.mode == Mode.HELP:
+                view = HelpView(self.help_scroll_y)
+                view.move(None, screen_rows, screen_cols)
+                self.help_scroll_y = view.offset
+            else:
+                text_cols = max(1, screen_cols - self._gutter_width())
+
+                vx, vy = get_visual_position(
+                    self.cursor.x, self.cursor.y, self.buffer.lines,
+                    text_cols, self.config.soft_wrap)
+                self.cursor.update_scroll(
+                    vy, vx, screen_rows, text_cols,
+                    self.config.smooth_scroll_margin, self.config.soft_wrap)
+
+                if self.selection.active:
+                    bounds = self._current_bounds()
+                    if not self.selection.is_empty(bounds):
+                        sel = bounds
 
             self.renderer.render(
                 self.buffer, self.cursor, message=self.message,
                 prompt=self.prompt, mode=self.mode,
                 selection=sel, mark_set=self.selection.active,
                 match=self.last_match,
-                doc_index=self.current, doc_count=len(self.documents),
+                all_matches=getattr(self, "all_matches", None),
+                keybindings=KEYBINDINGS if self.mode == Mode.HELP else None,
+                doc_index=self.current, 
+                doc_count=len(self.documents),
+                help_scroll_y=getattr(self, "help_scroll_y", 0),
             )
 
             try:
                 key = self._read_key(stdscr)
             except KeyboardInterrupt:
+                if self.mode == Mode.HELP:
+                    continue
                 self.running = False
                 break
 

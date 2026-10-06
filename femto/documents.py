@@ -23,6 +23,7 @@ class Document:
         self.selection = Selection()
         self.last_match = None
         self.last_found_pos = None
+        self.search_cache = None
 
     @property
     def filename(self):

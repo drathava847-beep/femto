@@ -2,9 +2,34 @@
 
 All notable changes to Femto are documented in this file.
 
-## [Unreleased / 0.0.3a01]
+## [0.0.3a03]
 
+### Added
+
+- **Word-Boundary Wrapping:** Soft wrap now breaks at spaces instead of mid-word (fixes #19)
+- Falls back to hard-cut when a single word exceeds viewport width
+- Added `wrap_at_word` config flag (default: `true`)
+- Visual/logical coordinate mapping automatically adapts to new chunking
+- Added `auto_indent` config option (default: `true`).
+- Full-screen categorized F1 help screen with scrolling (fixes #20) - thanks @feliperm17!
+- AST-based test
 - **I/O Fidelity:** Preserve CRLF/CR/LF line on save; added `line_ending` config (Thanks @HarshRajSinghania!)
+- **POSIX Compliance:** Ensure trailing newline on save (fixes #12)
+- Added `line_ending` and `final_newline` config options
+- Internal buffer normalizes to `\n` to keep cursor math and wrapping clean
+
+### Fixed
+- Python syntax highlighting for multi-line strings and docstrings (fixes #14) - thanks @feliperm17!
+- Highlighter now carries lexical state across lines.
+- Lazy invalidation via `buffer.revision` keeps performance optimal.
+- Unicode combining characters (accents, diacritics) now correctly measure as 0 terminal columns (fixes #25) - thanks @drathava847-beep!
+- **Smart Auto-Indent:** Enter key copies leading whitespace (fixes #17).
+- **Python Awareness:** Automatically adds an extra indent level when the previous line ends with a colon (`:`), correctly ignoring inline `#` comments.
+- ZWJ emoji sequences and variation selection now measure correctly in soft wrap (fixes #16) - thanks @drathava847-beep!
+
+### Tests
+- All search matches highlighted on screen with revision-keyed caching (fixes #22) - thanks @drathava847-beep!
+- Added regression test for hard-wrap behavior in `get_visual_postion()` with mutation validation (thanks @drathava847-beep!).
 
 ## [0.0.2] - Stable
 

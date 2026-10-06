@@ -66,7 +66,7 @@ class Selection:
             merged = buffer.lines[sy][:sx] + buffer.lines[ey][ex:]
             del buffer.lines[sy:ey + 1]
             buffer.lines.insert(sy, merged)
-        buffer.modified = True
+        buffer.touch()
         return sx, sy
 
 
@@ -98,5 +98,5 @@ class Clipboard:
             last = chunks[-1] + tail
             buffer.lines[y:y + 1] = [first] + chunks[1:-1] + [last]
             new_pos = (len(chunks[-1]), y + len(chunks) - 1)
-        buffer.modified = True
+        buffer.touch()
         return new_pos
